@@ -1,0 +1,327 @@
+=====================================================================
+ANALISIS DETALLADO: Aitology/Navisworks_MCP  (v2.0.0 / bridge 2.1)
+Generado con REA 6.9.0 (rea-agents) + revision manual del codigo
+=====================================================================
+Repositorio : https://github.com/Aitology/Navisworks_MCP
+Commit      : 97c3b63  "Revise README for clash detection updates-Release V2.0.0"
+Clon        : /home/user/aitology/navisworks_mcp   (shallow, --depth 1)
+Fecha       : 2026-11-17
+Objetivo    : servir de base para que, en una sesion local, se construya un
+              MCP nuevo desde cero que se comunique con Navisworks.
+
+---------------------------------------------------------------------
+0. RESUMEN EJECUTIVO
+---------------------------------------------------------------------
+- Es un puente de DOS piezas:
+    (a) MCPBridge.dll : addin .NET Framework 4.8 que corre DENTRO de
+        Navisworks Manage/Simulate y abre un servidor HTTP en
+        http://localhost:8765/ .
+    (b) server_http.py : servidor MCP (stdio) en Python que traduce cada
+        "tools/call" en un POST JSON a ese servidor HTTP.
+- No se encontro comportamiento malicioso. El DLL no usa Process, registro
+  de Windows, sockets ni WebClient, y no contacta hosts externos.
+- El DLL del release coincide con el codigo fuente en su conjunto de rutas
+  HTTP (40 = 40) y sus referencias de API.
+- Problemas reales: (1) servidor Python roto con mcp 2.x; (2) HTTP local sin
+  autenticacion ni validacion de origen, con rutas que borran datos;
+  (3) varias inconsistencias menores (seccion 6).
+- Alcance: analisis ESTATICO. Nada se ejecuto dentro de Navisworks.
+
+---------------------------------------------------------------------
+1. QUE SE ANALIZO Y CON QUE
+---------------------------------------------------------------------
+Herramientas REA usadas (todas estaticas, no cargan ni ejecutan el DLL):
+  - rea audit-release-exposure  <carpeta del release extraida>
+  - rea inspect-managed-artifact  MCPBridge.dll
+  - rea inspect-managed-members   MCPBridge.dll
+  - rea inspect-managed-native-boundaries MCPBridge.dll
+  - rea inspect-pe-imports (se invoco; el DLL es IL puro, sin imports
+    nativos relevantes)
+Revision manual: server_http.py, MCPBridgePlugin.cs (lectura de las
+secciones de ciclo de vida, listener, enrutado y E/S + busqueda de
+patrones sensibles en el resto), ClashGroupHandlers.cs, Install-Addin.ps1,
+Diagnose-Addin.ps1 (busqueda de patrones), MCPBridge.addin y .csproj.
+Prueba funcional: server_http.py contra un addin SIMULADO (servidor HTTP
+falso en 127.0.0.1:8765), usando el cliente MCP oficial por stdio.
+
+Limites declarados:
+  - REA no decompila C#; su proveedor .NET lee metadatos, firmas, anclas
+    CIL, referencias y cadenas literales. La logica de cada handler se
+    contrasto con el codigo fuente, no con una decompilacion del DLL.
+  - Las ~3.000 lineas de C# NO se leyeron linea por linea; se leyeron las
+    partes de arranque/red/E-S y se busco el resto con patrones.
+  - "El binario equivale al fuente" se apoya en coincidencia de rutas y
+    referencias, no en una compilacion reproducible.
+
+---------------------------------------------------------------------
+2. CONTENIDO DEL REPOSITORIO
+---------------------------------------------------------------------
+  ClashGroupHandlers.cs        556 lineas  handlers de grupos de clash
+  MCPBridgePlugin.cs          1784 lineas  plugin, listener, enrutado, handlers, JSON propio
+  server_http.py               491 lineas  servidor MCP (stdio) -> HTTP
+  Install-Addin.ps1             75 lineas  copia build a %APPDATA%\Autodesk\...\Plugins\MCPBridge
+  Diagnose-Addin.ps1           137 lineas  diagnostico (incl. chequeo Mark-of-the-Web)
+  MCPBridge.addin                          manifiesto
+  NavisworksMcpAddin.csproj/.sln           proyecto net48, x64
+  release/ MCPBridge.dll (86.016 B), MCPBridge.pdb (16.300 B), server_http.py
+  Navisworks MCP Release v2.0.0.zip (45.957 B) = mismos 3 archivos
+  docs/ architecture.svg, connection-flow.svg
+
+Hashes SHA-256 (zip == carpeta release/):
+  MCPBridge.dll   89c66e85fc09cd7465c47fe7f426c520af181762024d2fe5a5fc494dd2b8fcd0
+  MCPBridge.pdb   5f86075b5014d1cf946b1b00519f4f11f2fdf0b7a410600992f51f78505aed0c
+  server_http.py  af1210aafb25c1e68b997c65fe516ec2c3a97c2a45bd1705ac464a2665adf5ff
+  (server_http.py de la raiz == el del release)
+
+---------------------------------------------------------------------
+3. ARQUITECTURA
+---------------------------------------------------------------------
+Cliente MCP (Claude Desktop/Code, etc.)
+   --stdio JSON-RPC-->  server_http.py
+   --HTTP POST JSON-->  MCPBridge.dll (HttpListener en localhost:8765)
+   --SynchronizationContext.Send--> hilo de UI de Navisworks --> NwApi
+
+Flujo de una llamada:
+  1. El cliente envia tools/call por stdio.
+  2. server_http.py busca la herramienta en ROUTES, renombra argumentos con
+     PARAM_MAP (p. ej. test_name->name, clash_type->type,
+     max_results->limit, select_results->select) y hace POST a
+     http://localhost:8765<ruta> (timeout 30 s, Content-Type
+     application/json, usando urllib).
+  3. El plugin recibe la peticion en un hilo del ThreadPool, lee el cuerpo,
+     y despacha por ruta.
+  4. Todo lo que no es /health se ejecuta en el HILO DE UI con
+     _uiContext.Send(...) porque la API de Navisworks es de un solo hilo.
+  5. El resultado (tipos anonimos) se serializa con un serializador JSON
+     escrito a mano y se devuelve como application/json; los errores dan
+     HTTP 500 con {error, detail, path}.
+
+Decisiones notables del diseno original:
+  - JSON "hecho a mano" (sin System.Text.Json) para evitar conflictos de
+    version con lo que Navisworks ya carga. (El comentario de
+    Install-Addin.ps1 aun menciona System.Text.Json: texto obsoleto.)
+  - El listener se inicia en el constructor ESTATICO del plugin (al
+    descubrirse el tipo) y se captura SynchronizationContext.Current alli;
+    Execute() (boton del ribbon) reintenta la captura y muestra un
+    MessageBox de estado. Si el contexto es null, las llamadas fallan con
+    "UI SynchronizationContext not captured. Click the 'MCP Bridge' ribbon
+    button once to initialize."
+  - Log en %TEMP%\navisworks_mcp_addin.log (File.AppendAllText, sin
+    rotacion).
+  - Puerto fijo 8765, sin configuracion.
+
+---------------------------------------------------------------------
+4. HALLAZGOS DEL ANALISIS ESTATICO DEL DLL (REA)
+---------------------------------------------------------------------
+Identidad:
+  - Ensamblado "MCPBridge" v1.0.0.0, PE32+ x86_64, IL-only, sin firma de
+    nombre seguro (strong name), sin punto de entrada.
+  - Framework: .NETFramework,Version=v4.8 (runtime CLR v4.0.30319).
+  - Metadatos: 59 TypeDef, 444 MethodDef, 142 TypeRef, 493 MemberRef,
+    6 AssemblyRef. Cobertura de la inspeccion: complete, sin issues.
+Referencias de ensamblado:
+  mscorlib 4.0.0.0, System 4.0.0.0, System.Core 4.0.0.0,
+  System.Windows.Forms 4.0.0.0,
+  Autodesk.Navisworks.Api 24.0.0.0, Autodesk.Navisworks.Clash 24.0.0.0
+  (la correspondencia entre "24.0.0.0" y el ano de Navisworks NO se
+   verifico aqui; el .csproj apunta por defecto a Navisworks Manage 2027).
+Nativo:
+  - 0 module refs, 0 P/Invoke, 0 implementaciones nativas.
+APIs de sistema usadas (por MemberRef):
+  HttpListener/Context/Request/Response (red local), System.IO.File y
+  Path (log), Environment, Thread/ThreadPool/Monitor,
+  SynchronizationContext, StringBuilder/Encoding, MessageBox, Reflection
+  (MemberInfo/PropertyInfo, para serializar tipos anonimos), LINQ.
+  NO aparecen: Process, Registry, Socket, WebClient/HttpClient,
+  Assembly.Load, DllImport.
+Cadenas relevantes: 'http://localhost:{0}/', 'MCPBridge-HttpListener',
+  'navisworks_mcp_addin.log', mensajes de log y 40 rutas de API.
+Auditoria de exposicion del release (audit-release-exposure):
+  - native.debug_companions : exposed, severidad medium  (MCPBridge.pdb
+    junto al DLL).
+  - native.pdb_path         : exposed, severidad low
+    (ruta embebida: E:\MCP\Navisworks_MCP\addin\obj\Release\MCPBridge.pdb).
+  - text.credential_markers : not_observed (sin credenciales en el texto).
+  - Checks de JS/Electron/Go/Rust: no aplican o desconocidos (irrelevantes
+    para un DLL .NET).
+  - native.hardening / macho / android: not_assessed.
+
+---------------------------------------------------------------------
+5. SUPERFICIE DE API: 40 RUTAS HTTP (DLL == codigo fuente)
+---------------------------------------------------------------------
+Conjunto de rutas del DLL == conjunto del switch de Dispatch() en C#.
+Python expone 39 herramientas; falta en Python: /selection/by-name.
+
+Salud            /health                        (no usa hilo UI)
+Documento        /document/info, /document/statistics
+Seleccion        /selection/get, /selection/select-all,
+                 /selection/deselect-all, /selection/invert,
+                 /selection/from-set, /selection/by-name (solo C#)
+Sets             /sets/list, /sets/selection/create, /sets/search/create,
+                 /sets/delete, /sets/items, /sets/search/run
+Busqueda/props   /elements/find, /elements/find-by-name,
+                 /elements/properties
+Overrides        /elements/color, /elements/transparency,
+                 /elements/hide, /elements/unhide-all,
+                 /elements/isolate, /elements/reset-overrides
+Clash            /clash/list, /clash/create, /clash/set-selections,
+                 /clash/run, /clash/results, /clash/delete,
+                 /clash/group/create, /clash/group/list,
+                 /clash/group/delete, /clash/group/add-clashes,
+                 /clash/group/set-status
+Viewpoints       /viewpoints/list, /viewpoints/save, /viewpoints/goto,
+                 /viewpoints/delete, /viewpoints/current
+
+Herramientas MCP (nombre -> ruta), 39:
+  health_check, get_document_info, get_model_statistics,
+  list_clash_tests, create_clash_test, set_clash_selections,
+  run_clash_test, get_clash_results, delete_clash_test,
+  create_clash_group, list_clash_groups, delete_clash_group,
+  add_clashes_to_group, set_clash_group_status,
+  list_sets, create_selection_set, get_selection_set_items,
+  create_search_set, execute_search_set, delete_set,
+  find_items, find_items_by_name, select_all, deselect_all,
+  invert_selection, select_from_set, get_current_selection,
+  get_element_properties, color_elements, set_transparency,
+  reset_overrides, hide_elements, unhide_all, isolate_elements,
+  list_viewpoints, save_viewpoint, goto_viewpoint, delete_viewpoint,
+  get_current_viewpoint.
+
+Rutas DESTRUCTIVAS (modifican/borran el documento abierto):
+  /clash/delete, /clash/group/delete, /sets/delete, /viewpoints/delete,
+  ademas de las que alteran estado (hide/isolate/color/transparency,
+  seleccion, creacion de tests/sets/viewpoints).
+
+---------------------------------------------------------------------
+6. PROBLEMAS ENCONTRADOS
+---------------------------------------------------------------------
+[ALTO - funcional] server_http.py NO arranca con mcp 2.x
+  - `pip install mcp` hoy instala 2.3.0. Con esa version el servidor
+    muere al importar:  AttributeError: 'Server' object has no attribute
+    'list_tools'  (usa los decoradores @server.list_tools() y
+    @server.call_tool() de la serie 1.x).
+  - Verificado: con mcp 1.30.0 (pip install "mcp<2") funciona: lista 39
+    herramientas y enruta correctamente health_check, create_clash_test y
+    delete_clash_test; una herramienta desconocida devuelve isError=true.
+  - El README dice `pip install mcp` sin version -> falla para cualquiera.
+  - Nota: la instalacion global hecha en el contenedor de analisis quedo en
+    2.3.0; las pruebas con 1.30.0 se hicieron en un venv aparte.
+
+[MEDIO - seguridad] Addin sin autenticacion ni validacion de origen
+  - Escucha solo en localhost (bien), pero NO hay token, ni chequeo de
+    cabecera Host/Origin, ni de Content-Type; el cuerpo se parsea como JSON
+    sin importar el tipo.
+  - Consecuencia: cualquier proceso local, o una pagina web abierta en el
+    navegador (peticion "simple" cross-origin / DNS rebinding), podria
+    enviar POST a localhost:8765 e invocar rutas destructivas.
+  - Esto es un riesgo teorico derivado de la lectura del codigo; NO se
+    probo contra un Navisworks real.
+  - Tambien: sin limite de tamano de cuerpo, sin limite de concurrencia
+    (cada peticion usa un hilo del ThreadPool y bloquea en la UI).
+
+[BAJO - fuga de info] MCPBridge.pdb distribuido junto al DLL; revela la
+  ruta de compilacion E:\MCP\Navisworks_MCP\addin\obj\Release\.
+
+[BAJO - consistencia]
+  - MCPBridge.addin referencia <Assembly>NavisworksMcpAddin.dll</Assembly>
+    pero el ensamblado compilado se llama MCPBridge.dll (AssemblyName en el
+    .csproj; el DLL tiene [Plugin("MCPBridge","ADSK",...)] ). El comentario
+    del .addin tambien menciona NavisworksMcpAddin.dll. Si Navisworks usa
+    el manifiesto, el nombre no coincide. No verificado en ejecucion.
+  - /health devuelve routes = 35 y el MessageBox dice "Routes: 35", pero
+    hay 40 rutas. (El README dice 40, correcto.)
+  - README usa la carpeta "addin\" que no existe; los archivos estan en la
+    raiz. Install-Addin.ps1 asume BuildDir "bin\Release" relativo.
+  - Install-Addin.ps1 menciona dependencias de System.Text.Json que ya no
+    se usan (el csproj dice "No NuGet packages").
+  - Install-Addin.ps1 borra "$dest\*" -Recurse antes de copiar (solo la
+    carpeta MCPBridge del plugin; esperado, pero conviene saberlo).
+  - Developer="ADSK" en el atributo del plugin: el autor NO es Autodesk;
+    el valor es un identificador de 4 letras requerido por la API.
+  - Falta en Python la herramienta para /selection/by-name.
+  - Desajuste de rutas reportado por mi parte durante el analisis: en la
+    primera pasada conte "30 rutas" porque mi expresion regular ignoraba
+    guiones; el conteo correcto es 40 (C# y DLL) y 39 (Python).
+
+Tambien observado (informativo):
+  - Un solo puerto fijo; si otra instancia de Navisworks ya lo usa, el
+    listener falla y solo queda registrado en el log.
+  - El log crece sin limite en %TEMP%.
+  - Se asume documento activo; las rutas lanzan excepcion -> HTTP 500.
+
+---------------------------------------------------------------------
+7. LECCIONES PARA EL NUEVO MCP (sugerencias, no verificadas en Navisworks)
+---------------------------------------------------------------------
+Lo que conviene REUTILIZAR del diseno:
+  1. Separar "plugin dentro de Navisworks" del "servidor MCP": acopla poco
+     y permite reemplazar cada lado.
+  2. Marshalling al hilo de UI (el original usa SynchronizationContext.Send,
+     porque la API de Navisworks es de un solo hilo; evaluar si conviene
+     Post en vez de Send para no bloquear el hilo del listener).
+  3. Capturar el contexto de UI en la inicializacion del plugin.
+  4. Estructura de herramientas por dominio: documento, seleccion, sets,
+     busqueda/propiedades, overrides visuales, clash, viewpoints.
+  5. Mapeo de nombres de argumentos entre el lado MCP y el lado plugin.
+  6. Respuestas de error estructuradas (error/detail/path) y el hint de
+     "addin_unreachable" en el cliente.
+
+Lo que conviene MEJORAR:
+  1. Autenticacion: token aleatorio generado al iniciar el plugin
+     (guardado en un archivo con permisos de usuario o pasado por
+     variable de entorno) enviado en cabecera Authorization; rechazar
+     peticiones sin el.
+  2. Validar Host (solo localhost/127.0.0.1) y Origin; exigir
+     Content-Type: application/json; limite de tamano de cuerpo.
+  3. Alternativa a HTTP: canal local con ACL propia, como named pipes
+     (System.IO.Pipes) restringidos al usuario actual; elimina el riesgo
+     de acceso desde el navegador y el conflicto de puertos.
+  4. Puerto configurable o dinamico + archivo de descubrimiento.
+  5. Fijar dependencias: "mcp>=1.x,<2" (o migrar al nuevo API de 2.x tras
+     leer su documentacion) y usar un requirements.txt / pyproject.
+  6. Marcar herramientas destructivas (delete_*) y pedir confirmacion o
+     un parametro explicito; anotaciones MCP de destructiveHint.
+  7. Generar la lista de rutas/herramientas desde UNA sola fuente para que
+     C#, Python y README no se desincronicen (y /health cuente bien).
+  8. Pruebas: un addin simulado como el usado aqui permite probar el lado
+     MCP sin Navisworks; el lado C# requiere Navisworks.
+  9. No distribuir .pdb en releases; compilar con rutas deterministas.
+ 10. Rotar/limitar el log; no registrar cuerpos con datos del modelo.
+ 11. Alinear el manifiesto .addin con el nombre real del ensamblado y
+     probar la carga en cada version objetivo.
+
+Alternativas de arquitectura a evaluar en la sesion local:
+  A. Igual que Aitology pero endurecido (HTTP localhost + token).
+  B. Plugin con named pipe + servidor MCP que lo consume.
+  C. Servidor MCP alojado dentro del plugin (si el runtime de la version
+     objetivo de Navisworks lo permite; verificar framework: el repo usa
+     net48 con la API 24.0.0.0; confirmar el objetivo para 2025/2026/2027).
+  D. Automatizacion COM de Navisworks (el README original la descarta por
+     problemas de ProgID, sesion de usuario y API limitada).
+
+Datos a confirmar en la maquina local (no se pudieron verificar aqui):
+  - Version de Navisworks instalada y su framework objetivo (.NET).
+  - Rutas reales de la API (Autodesk.Navisworks.Api.dll / .Clash.dll).
+  - Carpeta de plugins efectiva por version.
+  - Si el addin carga con el manifiesto o solo por el atributo [Plugin].
+
+---------------------------------------------------------------------
+8. COMO REPRODUCIR EL ANALISIS
+---------------------------------------------------------------------
+  npm install -g rea-agents        # REA 6.9.0
+  # extraer el zip en una carpeta NUEVA y vacia (archivo no confiable)
+  rea audit-release-exposure <carpeta> --format md
+  rea inspect-managed-artifact <carpeta>/MCPBridge.dll --format json
+  rea inspect-managed-members  <carpeta>/MCPBridge.dll --format json
+  rea inspect-managed-native-boundaries <carpeta>/MCPBridge.dll --format json
+  python -m venv v && v/bin/pip install "mcp<2"   # prueba del lado Python
+
+---------------------------------------------------------------------
+9. CONCLUSION
+---------------------------------------------------------------------
+El proyecto es un puente coherente y sin comportamiento malicioso
+observado, pero (a) el lado Python esta roto con la version actual de mcp,
+(b) el addin no autentica a quien le habla, y (c) hay inconsistencias de
+empaquetado. Sirve como referencia de diseno; para uso real, el nuevo MCP
+deberia partir del patron de dos piezas con canal autenticado y versiones
+fijadas.
+=====================================================================
